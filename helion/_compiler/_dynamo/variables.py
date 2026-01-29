@@ -239,6 +239,9 @@ def _build_return_value(
             tx, "__getitem__", [variables.ConstantVariable.create(i)], {}
         )
 
+    if num_outputs <= 0:
+        # Kernel has no return statement (returns None implicitly)
+        return variables.ConstantVariable.create(None)
     if num_outputs > 1:
         return TupleVariable([get_output(i) for i in range(num_outputs)])
     return get_output(0)
@@ -410,14 +413,17 @@ class HelionKernelVariable(VariableTracker):
         # Step 2: Partition arguments into constants vs tensors
         # - constant_args: Python values (int, float, etc.) passed directly to kernel
         # - tensor_args: Tensor proxies that become graph inputs to the HOP
+        # Also track proxy identity to distinguish kernel(x, x) from kernel(x.clone(), x.clone())
         constant_args: dict[str, object] = {}
         tensor_args: dict[VariableTracker, VariableTracker] = {}
+        tensor_arg_proxy_ids: dict[str, int] = {}
         for name, var in param_vars.items():
             key = variables.ConstantVariable.create(name)
             if var.is_python_constant():
                 constant_args[name] = var.as_python_constant()
             else:
                 tensor_args[key] = var
+                tensor_arg_proxy_ids[name] = id(var.as_proxy())
 
         # Build ordered args in signature order (with defaults) for output inference
         ordered_args = [
@@ -432,6 +438,16 @@ class HelionKernelVariable(VariableTracker):
         # This determines: number of outputs, their shapes/dtypes, which inputs are mutated,
         # and which outputs alias which inputs
         output_spec = _infer_output_spec(self._kernel, ordered_args)
+
+        # Compute same_tensor_groups: list of lists of arg names that share the same proxy.
+        # This distinguishes kernel(x, x) (share clone) from kernel(x.clone(), x.clone()) (separate clones).
+        proxy_id_to_names: dict[int, list[str]] = {}
+        for name, proxy_id in tensor_arg_proxy_ids.items():
+            proxy_id_to_names.setdefault(proxy_id, []).append(name)
+        same_tensor_groups = [
+            sorted(names) for names in proxy_id_to_names.values() if len(names) > 1
+        ]
+        output_spec["same_tensor_groups"] = same_tensor_groups
 
         # Step 4: Emit a Higher-Order Op (HOP) node into the FX graph
         # The HOP encapsulates the entire Helion kernel call as a single graph node

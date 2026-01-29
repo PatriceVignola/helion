@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import torch
 
-
 def compute_slice_size(
     slice_obj: slice, original_size: int | torch.SymInt
 ) -> int | torch.SymInt:

@@ -99,6 +99,9 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         cfg = self._bound_kernel._config
         assert cfg is not None, "Config should be set after ensure_config_exists"
         host_fn = self._helion_kernel.name
+        inner_fn = f"_helion_{host_fn}"
+        # Use KERNEL_NAME placeholder for inner kernel so it gets a unique name
+        inner_fn_placeholder = f"_helion_{Placeholder.KERNEL_NAME}"
 
         # Generate Python AST for Triton kernel
         with self._bound_kernel.env:
@@ -117,6 +120,24 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         )
         if fn_node:
             fn_node.name = str(Placeholder.KERNEL_NAME)
+
+        # Rename inner Triton kernel function to avoid name collisions
+        # when the same kernel is called multiple times with different shapes
+        inner_fn_node = next(
+            (
+                n
+                for n in ast.walk(root)
+                if isinstance(n, ast.FunctionDef) and n.name == inner_fn
+            ),
+            None,
+        )
+        if inner_fn_node:
+            inner_fn_node.name = inner_fn_placeholder
+
+        # Update references to the inner kernel in the host function
+        for node in ast.walk(root):
+            if isinstance(node, ast.Name) and node.id == inner_fn:
+                node.id = inner_fn_placeholder
 
         # Unparse AST to Triton source code
         triton_code = get_needed_imports(root) + unparse(
@@ -239,6 +260,16 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         conditional = ("libdevice", "tl_math", "triton_helpers", "helion")
         for name in (*required, *(n for n in conditional if f"{n}." in src_code)):
             wrapper.add_import_once(library_imports[name])
+
+        # Add typing import for type annotations used in function signatures
+        # This is needed because Inductor doesn't use 'from __future__ import annotations'
+        wrapper.add_import_once("from typing import Optional")
+
+        # Add imports for captured global variables (e.g., "import __main__ as _source_module")
+        # These are tracked in HostFunction.global_imports during kernel compilation
+        if self._bound_kernel.host_function is not None:
+            for global_import in self._bound_kernel.host_function.global_imports.values():
+                wrapper.add_import_once(global_import.codegen())
 
         origins, detailed = get_kernel_metadata(node_schedule, wrapper)
         wrapper.header.writeline(f"# kernel path: {kernel_path}\n{origins}\n{detailed}")

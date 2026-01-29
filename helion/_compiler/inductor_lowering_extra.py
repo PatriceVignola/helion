@@ -15,7 +15,6 @@ from torch._inductor.ir import FlexibleLayout
 from torch._inductor.ir import IRNode
 from torch._inductor.ir import MultiOutput
 from torch._inductor.ir import MultiOutputLayout
-from torch._inductor.ir import Pointwise
 from torch._inductor.ir import ReinterpretView
 from torch._inductor.ir import StorageBox
 from torch._inductor.ir import TensorBox
@@ -25,6 +24,9 @@ from torch._inductor.lowering import to_dtype
 from torch._inductor.virtualized import V
 
 from ._inductor.template_buffer import HelionTemplateBuffer
+from helion._compiler._dynamo.fx_passes import (
+    decompose_helion_kernel_wrapper_functional,
+)
 from helion._compiler._dynamo.higher_order_ops import get_helion_kernel
 from helion._compiler._dynamo.higher_order_ops import (
     helion_kernel_wrapper_mutation as _helion_hop,
@@ -33,6 +35,38 @@ from helion._compiler._dynamo.higher_order_ops import (
 inductor_lowering_dispatch: dict[
     Callable[..., object] | str, Callable[..., object]
 ] = {}
+
+# Flag to track if we've installed the decompose pass hook
+_decompose_pass_installed = False
+
+
+def _install_decompose_pass_hook() -> None:
+    """Install Helion's decompose pass via Inductor's post_grad_custom_post_pass config.
+
+    This uses the official Inductor extension point to run Helion's decompose pass,
+    converting helion_kernel_wrapper_functional to clones + mutation HOP.
+    """
+    global _decompose_pass_installed
+    if _decompose_pass_installed:
+        return
+    _decompose_pass_installed = True
+
+    from torch._inductor import config as inductor_config
+
+    # Chain with any existing custom post pass
+    original_post_pass = inductor_config.post_grad_custom_post_pass
+
+    def _helion_post_grad_pass(graph: torch.fx.Graph) -> None:
+        """Run Helion's decompose pass, chaining with any existing custom pass."""
+        if original_post_pass is not None:
+            original_post_pass(graph)
+        decompose_helion_kernel_wrapper_functional(graph)
+
+    inductor_config.post_grad_custom_post_pass = _helion_post_grad_pass
+
+
+# Install the decompose pass hook at module load time
+_install_decompose_pass_hook()
 
 
 def create_fp16_to_fp32_unary_fallback_lowering(
@@ -82,6 +116,9 @@ def patch_inductor_lowerings() -> Generator[None, None, None]:
     This is useful for overwriting specific Inductor lowerings without
     affecting the global state, especially in cases where Helion
     is missing support for a specific lowering.
+
+    Note: The decompose pass for helion_kernel_wrapper_functional is installed
+    permanently at module load time via _install_decompose_pass_hook().
     """
     # pyrefly: ignore [implicit-import]
     original_lowerings = torch._inductor.lowering.lowerings.copy()
@@ -174,70 +211,6 @@ def var_mean(
     )
 
 
-def _clone_mutated_graph_output_inputs(
-    mutated_names: set[str],
-    realized: dict[str, IRNode],
-    realize_fn: Callable[[TensorBox], IRNode],
-) -> None:
-    """Clone realized inputs that are mutated AND also appear as graph outputs.
-
-    When AOT autograd eliminates a user's clone, a mutated input may also
-    appear as a graph output that should retain its pre-mutation value.
-    This replaces the entry in ``realized`` with a fresh copy so the HOP
-    mutates the copy while the original buffer (still in V.graph.env)
-    remains available unmutated for the graph output.
-    """
-    current_node: torch.fx.Node | None = getattr(V.graph, "current_node", None)
-    if current_node is None:
-        return
-    fx_tensor_args = current_node.kwargs.get("tensor_args", {})
-    if not fx_tensor_args:
-        return
-
-    # Collect FX nodes that are direct graph outputs
-    output_fx_nodes: set[torch.fx.Node] = set()
-    for fx_node in V.graph.module.graph.nodes:
-        if fx_node.op == "output":
-
-            def _collect(arg: object) -> None:
-                if isinstance(arg, torch.fx.Node):
-                    output_fx_nodes.add(arg)
-                elif isinstance(arg, (tuple, list)):
-                    for a in arg:
-                        _collect(a)
-
-            _collect(fx_node.args)
-            break
-
-    if not output_fx_nodes:
-        return
-
-    # Track cloned FX nodes so multiple args pointing to the same node
-    # (identical aliased inputs) share a single clone buffer.
-    cloned: dict[torch.fx.Node, IRNode] = {}
-    for name in mutated_names:
-        fx_arg_node = fx_tensor_args.get(name)
-        if (
-            isinstance(fx_arg_node, torch.fx.Node)
-            and fx_arg_node in output_fx_nodes
-            and name in realized
-        ):
-            if fx_arg_node in cloned:
-                realized[name] = cloned[fx_arg_node]
-            else:
-                orig = realized[name]
-                clone_tb = Pointwise.create(
-                    device=orig.get_device(),
-                    dtype=orig.get_dtype(),
-                    inner_fn=orig.make_loader(),
-                    ranges=list(orig.get_size()),
-                )
-                assert isinstance(clone_tb, TensorBox)
-                clone_ir = realize_fn(clone_tb)
-                realized[name] = clone_ir
-                cloned[fx_arg_node] = clone_ir
-
-
 @register_lowering(_helion_hop, type_promotion_kind=None)
 def lower_helion_kernel(
     *,
@@ -267,14 +240,6 @@ def lower_helion_kernel(
     realized = {
         n: realize(tb) for n, tb in tensor_args.items() if isinstance(tb, TensorBox)
     }
-
-    # Clone mutated inputs that are also graph outputs.  After AOT autograd
-    # eliminates a user's clone, the mutated input and graph output share
-    # the same buffer.  By giving the HOP a fresh copy, the original buffer
-    # (still referenced via V.graph.env) stays unmutated for the graph output.
-    mutated_names = set(cast("list[str]", output_spec.get("mutated_inputs", [])))
-    if mutated_names:
-        _clone_mutated_graph_output_inputs(mutated_names, realized, realize)
 
     # Build ordered arg_names and inputs lists from realized
     arg_names = list(realized.keys())
@@ -318,7 +283,21 @@ def lower_helion_kernel(
         )
 
     # Determine buffer layout
-    if num_outputs == 1:
+    if num_outputs <= 0:
+        # Void-returning kernel: use a minimal layout.
+        # The buffer still executes mutations but produces no output tensor.
+        # num_outputs is -1 when kernel has no return statement.
+        device = torch.device("cuda")  # Default device
+        if inputs:
+            inp_device = inputs[0].get_device()
+            if inp_device is not None:
+                device = inp_device
+        layout = FixedLayout(
+            device=device,
+            dtype=torch.float32,
+            size=[sympy.Integer(1)],  # Minimal size
+        )
+    elif num_outputs == 1:
         layout = make_layout(0)
         if layout is None:
             raise ValueError("Single-output kernel must return a tensor, not a scalar")
@@ -419,5 +398,11 @@ def lower_helion_kernel(
             fallback = make_layout(0)
             if fallback:
                 buf.layout = fallback
+
+    if num_outputs <= 0:
+        # Void-returning kernel: return (None,) to indicate no return value.
+        # The buffer is still created above for mutation side effects.
+        # num_outputs is -1 when kernel has no return statement.
+        return (None,)
 
     return tuple(results)
