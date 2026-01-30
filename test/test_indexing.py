@@ -24,6 +24,24 @@ from helion._testing import skipIfTileIR
 import helion.language as hl
 
 
+def _skip_if_low_cuda_memory(
+    test_case: unittest.TestCase,
+    *,
+    required_bytes: int,
+    context: str,
+) -> None:
+    if DEVICE.type != "cuda":
+        return
+    free_bytes, _ = torch.cuda.mem_get_info()
+    if free_bytes < required_bytes:
+        required_gib = required_bytes / (1024**3)
+        available_gib = free_bytes / (1024**3)
+        test_case.skipTest(
+            f"{context} needs ~{required_gib:.1f} GiB free, "
+            f"only {available_gib:.1f} GiB available"
+        )
+
+
 @helion.kernel
 def broadcast_add_3d(
     x: torch.Tensor, bias1: torch.Tensor, bias2: torch.Tensor
@@ -523,30 +541,33 @@ class TestIndexing(RefEagerTestBase, TestCase):
         small_shape = (128, 128)
         large_shape = (51200, 51200)
 
-        if DEVICE.type == "cuda":
-            free_bytes, _ = torch.cuda.mem_get_info()
-            element_size = 2  # torch.bfloat16 element size in bytes
-            # Worst case: inputs, kernel output, reference output, and temporary buffers.
-            # Give ourselves margin by budgeting for 5 tensors of this shape.
-            required_bytes = 5 * math.prod(large_shape) * element_size
-            if free_bytes < required_bytes:
-                required_gib = required_bytes / (1024**3)
-                available_gib = free_bytes / (1024**3)
-                self.skipTest(
-                    f"Large BF16 add needs ~{required_gib:.1f} GiB free, only {available_gib:.1f} GiB available"
-                )
-
         run_case(
             small_shape,
             index_dtype=torch.int32,
             expect_int64_in_code=False,
             expect_error=None,
         )
+        element_size = torch.tensor([], dtype=torch.bfloat16).element_size()
+        # Worst case: inputs, kernel output, reference output, and temporary buffers.
+        # Give ourselves margin by budgeting for 5 tensors of this shape.
+        required_bytes = 5 * math.prod(large_shape) * element_size
+        _skip_if_low_cuda_memory(
+            self,
+            required_bytes=required_bytes,
+            context="Large BF16 add",
+        )
         run_case(
             large_shape,
             index_dtype=torch.int32,
             expect_int64_in_code=False,
             expect_error=helion.exc.InputTensorNumelExceedsIndexType,
+        )
+        # Add margin for reference + comparison buffers (isclose/temporary).
+        required_bytes = 8 * math.prod(large_shape) * element_size
+        _skip_if_low_cuda_memory(
+            self,
+            required_bytes=required_bytes,
+            context="Large BF16 add (int64 + comparison)",
         )
         run_case(
             large_shape,
@@ -634,6 +655,14 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
         B = 2**15
         D = 2**17
+        element_size = torch.tensor([], dtype=torch.float16).element_size()
+        # Input + output + comparison buffers.
+        required_bytes = 4 * B * D * element_size
+        _skip_if_low_cuda_memory(
+            self,
+            required_bytes=required_bytes,
+            context="Large tensor copy",
+        )
         inp = torch.randn(B, D, device=DEVICE, dtype=torch.float16)
         out = f(inp)
         assert (out == inp).all()
