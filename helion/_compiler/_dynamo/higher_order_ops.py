@@ -9,6 +9,7 @@ from torch._higher_order_ops import effects as hop_effects
 from torch._higher_order_ops.utils import register_fake
 from torch._library.effects import EffectType
 from torch._ops import HigherOrderOperator
+from torch._prims_common import compute_required_storage_length
 import torch.fx.experimental.proxy_tensor
 from torch.fx.experimental.proxy_tensor import ProxyTorchDispatchMode
 from torch.fx.experimental.proxy_tensor import disable_proxy_modes_tracing
@@ -19,6 +20,146 @@ if TYPE_CHECKING:
     from torch._subclasses.functional_tensor import BaseFunctionalizeAPI
 
     from helion.runtime.kernel import Kernel
+
+
+def _group_aliased_tensors(
+    tensors_to_clone: list[str],
+    tensor_args: dict[str, torch.Tensor],
+    name_to_group: dict[str, int],
+) -> list[list[tuple[str, torch.Tensor]]]:
+    """Group tensors by storage aliasing using union-find.
+
+    Tensors are grouped if they share storage (detected via torch._C._is_alias_of).
+    Tensors with different Dynamo-time proxy groups are kept separate.
+
+    Returns:
+        List of groups, where each group is a list of (name, tensor) tuples.
+    """
+    if not tensors_to_clone:
+        return []
+
+    # Union-find implementation
+    parent: dict[str, str] = {name: name for name in tensors_to_clone}
+
+    def find(x: str) -> str:
+        if parent[x] != x:
+            parent[x] = find(parent[x])
+        return parent[x]
+
+    def union(x: str, y: str) -> None:
+        px, py = find(x), find(y)
+        if px != py:
+            parent[px] = py
+
+    # Merge tensors only if they satisfy BOTH conditions:
+    # 1. Same Dynamo-time proxy group (same_tensor_groups) - to avoid merging unrelated
+    #    tensors that happen to share storage due to Inductor's memory optimization
+    # 2. Actually share storage at runtime (torch._C._is_alias_of) - to avoid merging
+    #    tensors where Inductor optimized away one of them (e.g., computed only a slice
+    #    instead of the full tensor)
+    #
+    # The Dynamo-time grouping is based on:
+    # 1. Proxy identity (kernel(x, x) puts both args in same group)
+    # 2. Storage aliasing of fake tensors (kernel(x[:2], x) also groups them)
+    for i, name1 in enumerate(tensors_to_clone):
+        t1 = tensor_args[name1]
+        group1 = name_to_group.get(name1)
+        for name2 in tensors_to_clone[i + 1 :]:
+            t2 = tensor_args[name2]
+            group2 = name_to_group.get(name2)
+            # Check if they are in the SAME Dynamo-time group
+            same_dynamo_group = (
+                group1 is not None and group2 is not None and group1 == group2
+            )
+            # Only merge if BOTH conditions are satisfied:
+            # same Dynamo-time group AND actually share storage at runtime
+            # pyrefly: ignore[missing-attribute]
+            if same_dynamo_group and torch._C._is_alias_of(t1, t2):
+                union(name1, name2)
+
+    # Build groups from union-find result
+    groups_dict: dict[str, list[tuple[str, torch.Tensor]]] = {}
+    for name in tensors_to_clone:
+        root = find(name)
+        groups_dict.setdefault(root, []).append((name, tensor_args[name]))
+
+    return list(groups_dict.values())
+
+
+def _clone_tensors_preserving_aliasing(
+    tensor_args: dict[str, torch.Tensor],
+    tensors_to_clone: list[str],
+    same_tensor_groups: list[list[str]],
+) -> dict[str, torch.Tensor]:
+    """Clone tensors while preserving aliasing relationships between them.
+
+    When multiple tensors share the same underlying storage (e.g., a view and its base),
+    we must clone them in a way that preserves this relationship. Otherwise, mutations
+    to one tensor won't be visible through the other.
+
+    Args:
+        tensor_args: Dict mapping arg names to tensors
+        tensors_to_clone: List of arg names that need to be cloned
+        same_tensor_groups: Groups of args that had the same proxy at Dynamo time
+
+    Returns:
+        Dict mapping arg names to cloned tensors (preserving aliasing)
+    """
+    if not tensors_to_clone:
+        return {}
+
+    # Build name_to_group mapping for proxy-identity groups
+    name_to_group: dict[str, int] = {}
+    for group_idx, group in enumerate(same_tensor_groups):
+        for name in group:
+            name_to_group[name] = group_idx
+
+    # Group tensors by storage aliasing
+    alias_groups = _group_aliased_tensors(
+        tensors_to_clone, tensor_args, name_to_group
+    )
+
+    cloned_tensors: dict[str, torch.Tensor] = {}
+
+    for tensors in alias_groups:
+        if len(tensors) == 1:
+            # Single tensor, simple clone
+            key, val = tensors[0]
+            cloned_tensors[key] = val.clone()
+        else:
+            # Multiple tensors share storage - need to preserve aliasing
+            # Find the range of storage elements covered by all tensors
+            min_offset = min(t.storage_offset() for _, t in tensors)
+            max_end = max(
+                compute_required_storage_length(t.shape, t.stride(), t.storage_offset())
+                for _, t in tensors
+            )
+            storage_size = max_end - min_offset
+
+            # Create a 1D tensor covering the needed storage range using as_strided
+            first_tensor = tensors[0][1]
+            temp_1d = torch.as_strided(
+                first_tensor,
+                (storage_size,),
+                (1,),
+                min_offset,
+            )
+            # Clone the 1D tensor - this clones the storage region we need
+            cloned_1d = temp_1d.clone()
+
+            # Recreate each tensor as a view of the cloned storage
+            for key, val in tensors:
+                # Adjust offset relative to the cloned 1D tensor
+                new_offset = val.storage_offset() - min_offset
+                cloned_val = torch.as_strided(
+                    cloned_1d,
+                    val.size(),
+                    val.stride(),
+                    new_offset,
+                )
+                cloned_tensors[key] = cloned_val
+
+    return cloned_tensors
 
 
 class HelionKernelWrapperMutation(HigherOrderOperator):
@@ -253,34 +394,17 @@ def helion_kernel_wrapper_functional_dense(
     tensors_to_clone: list[str],
 ) -> tuple[tuple[torch.Tensor | object, ...], dict[str, Any]]:
     """Clone specified inputs, call mutation HOP, return kernel outputs and cloned tensors."""
-    # Use same_tensor_groups to share clones for args that had the same proxy at Dynamo time.
-    # This distinguishes kernel(x, x) (share clone) from kernel(x.clone(), x.clone()) (separate clones).
     same_tensor_groups = cast("list[list[str]]", output_spec.get("same_tensor_groups", []))
-    name_to_group: dict[str, int] = {}
-    for group_idx, group in enumerate(same_tensor_groups):
-        for name in group:
-            name_to_group[name] = group_idx
 
-    # Clone using (tensor_id, group_idx) as key. Args in the same group share a clone.
-    clone_cache: dict[tuple[int, int], torch.Tensor] = {}
-    cloned_tensor_args: dict[str, torch.Tensor] = {}
-    unique_counter = 0
-    for key, val in tensor_args.items():
-        if key in tensors_to_clone:
-            tid = id(val)
-            group_idx = name_to_group.get(key)
-            if group_idx is None:
-                unique_counter -= 1
-                group_idx = unique_counter
-            clone_key = (tid, group_idx)
-            if clone_key not in clone_cache:
-                # Use .clone() (not clone_preserve_strides) to ensure contiguous storage.
-                # For mutation targets, each element must have independent storage to avoid
-                # write conflicts (e.g., broadcast tensors with stride 0 would alias writes).
-                clone_cache[clone_key] = val.clone()
-            cloned_tensor_args[key] = clone_cache[clone_key]
-        else:
-            cloned_tensor_args[key] = val
+    # Clone tensors while preserving aliasing relationships
+    cloned_tensors = _clone_tensors_preserving_aliasing(
+        tensor_args, tensors_to_clone, same_tensor_groups
+    )
+
+    # Build cloned_tensor_args: cloned tensors for those to clone, original for others
+    cloned_tensor_args = {
+        key: cloned_tensors.get(key, val) for key, val in tensor_args.items()
+    }
 
     kernel_outputs = helion_kernel_wrapper_mutation(
         kernel_idx=kernel_idx,
@@ -289,7 +413,6 @@ def helion_kernel_wrapper_functional_dense(
         output_spec=output_spec,
     )
 
-    cloned_tensors = {key: cloned_tensor_args[key] for key in tensors_to_clone}
     return (kernel_outputs, cloned_tensors)
 
 
@@ -309,29 +432,12 @@ def helion_kernel_wrapper_functional_fake(
         tensor_args=tensor_args,
         output_spec=output_spec,
     )
-    # Use same_tensor_groups to share clones for args with same proxy at Dynamo time
     same_tensor_groups = cast("list[list[str]]", output_spec.get("same_tensor_groups", []))
-    name_to_group: dict[str, int] = {}
-    for group_idx, group in enumerate(same_tensor_groups):
-        for name in group:
-            name_to_group[name] = group_idx
 
-    clone_cache: dict[tuple[int, int], torch.Tensor] = {}
-    cloned_tensors: dict[str, torch.Tensor] = {}
-    unique_counter = 0
-    for key in tensors_to_clone:
-        val = tensor_args[key]
-        tid = id(val)
-        group_idx = name_to_group.get(key)
-        if group_idx is None:
-            unique_counter -= 1
-            group_idx = unique_counter
-        clone_key = (tid, group_idx)
-        if clone_key not in clone_cache:
-            # Use .clone() (not clone_preserve_strides) to ensure contiguous storage.
-            # For mutation targets, each element must have independent storage.
-            clone_cache[clone_key] = val.clone()
-        cloned_tensors[key] = clone_cache[clone_key]
+    # Clone tensors while preserving aliasing relationships
+    cloned_tensors = _clone_tensors_preserving_aliasing(
+        tensor_args, tensors_to_clone, same_tensor_groups
+    )
     return (kernel_outputs, cloned_tensors)
 
 

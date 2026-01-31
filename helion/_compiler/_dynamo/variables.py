@@ -188,8 +188,18 @@ def _expand_mutated_inputs_with_aliases(
     mutated_inputs: Sequence[str],
     param_names: Sequence[str],
     example_args: Sequence[object],
+    graph_input_names: set[str] | None = None,
 ) -> list[str]:
-    """Expand mutated inputs to include any aliased tensor arguments."""
+    """Expand mutated inputs to include any aliased tensor arguments.
+
+    Args:
+        mutated_inputs: Names of directly mutated inputs
+        param_names: All parameter names in signature order
+        example_args: Example values for each parameter (fake tensors)
+        graph_input_names: Set of parameter names that are graph inputs (placeholders).
+            If provided, only expand to include aliased tensors that are graph inputs.
+            This avoids issues where Inductor optimizes away intermediates.
+    """
     if not mutated_inputs:
         return []
     tensors = {
@@ -205,7 +215,11 @@ def _expand_mutated_inputs_with_aliases(
             continue
         for other, t in tensors.items():
             if other != name and _check_tensor_alias(t, tensors[name]):
-                mutated.add(other)
+                # Only expand to include aliased tensors that are graph inputs.
+                # Intermediates (non-placeholder nodes) may be optimized away by Inductor,
+                # breaking the aliasing relationship at runtime.
+                if graph_input_names is None or other in graph_input_names:
+                    mutated.add(other)
     return [n for n in param_names if n in mutated]
 
 
@@ -354,10 +368,22 @@ def _infer_output_spec(
     mutated_inputs = _find_mutated_inputs(
         bound.host_function, bound.host_function.device_ir, input_names
     )
+    # Detect which arguments are graph inputs (placeholder nodes in FX graph).
+    # Intermediate tensors (non-placeholders) may be optimized away by Inductor,
+    # so we should only expand to include aliased graph inputs.
+    graph_input_names: set[str] = set()
+    for name, arg in zip(param_names, args, strict=True):
+        if arg.is_python_constant():
+            continue
+        proxy = arg.as_proxy()
+        if proxy is not None and hasattr(proxy, "node"):
+            if proxy.node.op == "placeholder":
+                graph_input_names.add(name)
     # Expand to include aliased tensors: if input A is mutated and input B aliases A,
-    # then B is effectively mutated too (they share the same underlying storage)
+    # then B is effectively mutated too (they share the same underlying storage).
+    # Only expand to graph inputs, as intermediates may be optimized away by Inductor.
     mutated_inputs = _expand_mutated_inputs_with_aliases(
-        mutated_inputs, param_names, fake_args
+        mutated_inputs, param_names, fake_args, graph_input_names
     )
 
     return {
@@ -439,13 +465,68 @@ class HelionKernelVariable(VariableTracker):
         # and which outputs alias which inputs
         output_spec = _infer_output_spec(self._kernel, ordered_args)
 
-        # Compute same_tensor_groups: list of lists of arg names that share the same proxy.
-        # This distinguishes kernel(x, x) (share clone) from kernel(x.clone(), x.clone()) (separate clones).
-        proxy_id_to_names: dict[int, list[str]] = {}
+        # Compute same_tensor_groups: list of lists of arg names that should share clones.
+        # Two tensors should share a clone if:
+        # 1. They have the same proxy (kernel(x, x)), OR
+        # 2. They share storage (kernel(x[:2], x) - view and base)
+        #
+        # We detect storage aliasing using fake tensors at Dynamo time. This is important
+        # because at runtime, Inductor might optimize unrelated tensors to share storage,
+        # but we must preserve the source code semantics.
+        #
+        # Algorithm: Union-find to merge groups based on proxy identity and fake tensor aliasing.
+        tensor_names = list(tensor_arg_proxy_ids.keys())
+
+        # Get fake tensors for aliasing detection
+        def get_fake_tensor(var: VariableTracker) -> torch.Tensor | None:
+            proxy = var.as_proxy() if hasattr(var, "as_proxy") else None
+            if proxy is not None and hasattr(proxy, "node"):
+                val = proxy.node.meta.get("example_value")
+                if isinstance(val, torch.Tensor):
+                    return val
+            return None
+
+        fake_tensors = {name: get_fake_tensor(param_vars[name]) for name in tensor_names}
+
+        # Union-find for grouping
+        parent: dict[str, str] = {name: name for name in tensor_names}
+
+        def find(x: str) -> str:
+            if parent[x] != x:
+                parent[x] = find(parent[x])
+            return parent[x]
+
+        def union(x: str, y: str) -> None:
+            px, py = find(x), find(y)
+            if px != py:
+                parent[px] = py
+
+        # Group by proxy identity
         for name, proxy_id in tensor_arg_proxy_ids.items():
-            proxy_id_to_names.setdefault(proxy_id, []).append(name)
+            for other_name, other_proxy_id in tensor_arg_proxy_ids.items():
+                if name < other_name and proxy_id == other_proxy_id:
+                    union(name, other_name)
+
+        # Group by fake tensor aliasing
+        for i, name1 in enumerate(tensor_names):
+            t1 = fake_tensors.get(name1)
+            if t1 is None:
+                continue
+            for name2 in tensor_names[i + 1 :]:
+                t2 = fake_tensors.get(name2)
+                if t2 is None:
+                    continue
+                # pyrefly: ignore[missing-attribute]
+                if torch._C._is_alias_of(t1, t2):
+                    union(name1, name2)
+
+        # Build same_tensor_groups from union-find result
+        groups_dict: dict[str, list[str]] = {}
+        for name in tensor_names:
+            root = find(name)
+            groups_dict.setdefault(root, []).append(name)
         same_tensor_groups = [
-            sorted(names) for names in proxy_id_to_names.values() if len(names) > 1
+            sorted(names) for names in groups_dict.values() if len(names) > 1
         ]
         output_spec["same_tensor_groups"] = same_tensor_groups
 

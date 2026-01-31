@@ -297,6 +297,27 @@ def k_wait_update(
 
 
 # =============================================================================
+# View and Base Tensor Edge Cases
+# =============================================================================
+
+
+@helion.kernel(autotune_effort="none")
+def k_mutate_view_and_read_base(
+    x_view: torch.Tensor, y: torch.Tensor, x_base: torch.Tensor
+) -> torch.Tensor:
+    """Mutate x_view (a view of x_base) and also read from x_base.
+
+    This tests the edge case where a kernel receives both a view and its base
+    tensor as separate arguments. The mutation through the view should be
+    visible in the base tensor.
+    """
+    for tile in hl.tile(x_view.size()):
+        x_view[tile] = x_view[tile] + y[tile]
+    # Return a different slice of the base tensor
+    return x_base[2:4, 4:8]
+
+
+# =============================================================================
 # Captured Global Variables
 # =============================================================================
 
@@ -324,6 +345,7 @@ _ALL_KERNELS = [
     k_mutate_two_return_new, k_add_into_out, k_atomic_add_to_out, k_slice_mutate,
     k_slice_return_other, k_mutate_permuted, k_mutate_return_view,
     k_create_return_view, k_signal, k_wait_update, k_scale_with_captured,
+    k_mutate_view_and_read_base,
 ]
 
 
@@ -2257,6 +2279,118 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         self.assertEqual(len(graph_breaks), 0, f"Graph breaks: {dict(graph_breaks)}")
 
         # Compare results
+        torch.testing.assert_close(actual, expected)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_view_and_base_as_separate_args(self):
+        """Test: kernel receives both a view and its base tensor as separate args.
+
+        This tests a subtle edge case where the kernel mutates a view while also
+        receiving the base tensor as a separate argument. The mutation through
+        the view should be visible in the base tensor after the call.
+
+        Bug scenario: The compiled code might clone the view before mutation,
+        breaking the aliasing relationship with the base tensor.
+        """
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x_view = x[:2, :4]  # View of x
+            # Pass both view and base to kernel - view gets mutated
+            result = k_mutate_view_and_read_base(x_view, y, x)
+            return result, x  # Return result and base (which should show mutation)
+
+        # Warmup
+        torch._dynamo.reset()
+        torch._dynamo.utils.counters.clear()
+        k_mutate_view_and_read_base.reset()
+        warmup_x = torch.randn(8, 8, device=DEVICE, dtype=torch.float16)
+        warmup_y = torch.randn(2, 4, device=DEVICE, dtype=torch.float16)
+        _ = k_mutate_view_and_read_base(warmup_x[:2, :4], warmup_y, warmup_x)
+
+        # Test inputs
+        x = torch.randn(8, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(2, 4, device=DEVICE, dtype=torch.float16)
+
+        # Expected (eager)
+        x_eager = x.clone()
+        y_eager = y.clone()
+        expected = f(x_eager, y_eager)
+
+        # Actual (compiled)
+        x_compiled = x.clone()
+        y_compiled = y.clone()
+        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
+        actual = compiled_f(x_compiled, y_compiled)
+
+        # Verify no graph breaks
+        graph_breaks = torch._dynamo.utils.counters["graph_break"]
+        self.assertEqual(len(graph_breaks), 0, f"Graph breaks: {dict(graph_breaks)}")
+
+        # Compare results - this currently fails due to a bug
+        torch.testing.assert_close(actual, expected)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    @unittest.expectedFailure  # Known limitation: cross-kernel view mutation propagation
+    def test_overlapping_views_both_mutated(self):
+        """Test: two overlapping views of the same tensor, both mutated.
+
+        This tests aliasing between overlapping views. When view1 and view2
+        overlap, mutating view2 should be visible through view1 since they
+        share underlying storage.
+
+        Bug scenario: The compiled code returns result1 (which is view1) with
+        only the first mutation applied, missing the second mutation that
+        happened through the overlapping view2.
+
+        NOTE: This is a known limitation. When two separate kernel calls mutate
+        overlapping views, the mutation from the second call doesn't propagate
+        to the first view. This is because Dynamo traces the view operations
+        before the kernel calls, so view2 points to the original x, not the
+        functionally updated version after the first kernel mutates view1.
+        Fixing this would require propagating mutations through base tensors
+        at functionalization time.
+        """
+
+        def f(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            view1 = x[:3, :]  # First 3 rows
+            view2 = x[1:4, :]  # Rows 1-3 (overlaps with view1)
+            ones = torch.ones_like(view1)
+            # Mutate view1 (+1)
+            result1 = k_add_inplace(view1, ones)
+            # Mutate view2 (+2) - overlaps with result1
+            twos = torch.ones_like(view2) * 2
+            result2 = k_add_inplace(view2, twos)
+            # result1 should show rows 1-2 with +1+2=+3 effect
+            return result1, result2
+
+        # Warmup
+        torch._dynamo.reset()
+        torch._dynamo.utils.counters.clear()
+        k_add_inplace.reset()
+        warmup_x = torch.randn(5, 4, device=DEVICE, dtype=torch.float16)
+        _ = k_add_inplace(
+            warmup_x[:3, :], torch.ones(3, 4, device=DEVICE, dtype=torch.float16)
+        )
+
+        # Test inputs
+        x = torch.randn(5, 4, device=DEVICE, dtype=torch.float16)
+
+        # Expected (eager)
+        x_eager = x.clone()
+        expected = f(x_eager)
+
+        # Actual (compiled)
+        x_compiled = x.clone()
+        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
+        actual = compiled_f(x_compiled)
+
+        # Verify no graph breaks
+        graph_breaks = torch._dynamo.utils.counters["graph_break"]
+        self.assertEqual(len(graph_breaks), 0, f"Graph breaks: {dict(graph_breaks)}")
+
+        # Compare results - this currently fails due to a bug
         torch.testing.assert_close(actual, expected)
 
 
